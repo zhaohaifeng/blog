@@ -1,0 +1,98 @@
+---
+title: '分布式协议paxos,quorum以及zab'
+tags: [分布式,paxos,quorum,zab]
+---
+
+## CAP
+
+说到分布式，首先要说的是CAP。
+CAP，指的是：
+* **C**onsistency 一致性，所有节点之间数据是保持一致的。
+* **A**vailability 可用性，向服务发起的请求可以立即得到非错的响应。
+* **P**artition tolerance 分区容错性，可以容忍由于分区导致的一些异常问题，比容网络延时、通讯异常、服务宕机等等。
+
+CAP理论是由加州大学伯克利分校的计算机科学家**埃里克·布鲁尔**提出的猜想，时在一个分布式系统中，这三者无法同时满足。后续这个理论得到了证明从而成为一个定理。
+
+### CAP不可兼容
+
+对于大多数系统，**P**分区容错性时最重要的性质（不然还讲分布式做什么:)）因此这套体系关键点在于C一致性和A可用性的矛盾。即在一个拥有大量节点的服务中，如果要保证高可用性，就要有一定的容灾能力，设计上数据存储在多个服务器当中。但在多节点的数据的传输随时可能由于节点宕机、网络延迟等等问题导致数据不可达，那么节点在响应数据请求时，响应结果可能会出现不一致的情况。  如果要保持一致，只能降低可用性（比如在数据不一致时服务不可用等等）。
+
+现在流行的分布式协议，其实都是在CAP中，尤其是CA中找寻一个适当的平衡点，从而有了Base理论：既然无法做到高可用强一致性，那么就选择**基本可用最终一致性**。
+* **BA** Basically Available 基本可用性；
+* **S**oft 软状态；
+* **E**ventual Consistency 最终一致性。
+
+### AP和CP并非绝对
+同时在笔者看来，CAP虽是一个定理，但每个分布式协议或者分布式实现，并不是非黑即白的。不是说一个协议，要么说CP，可用性不强，要么是AP，一致性不强。 而是会找寻一些平衡，按照自身的理念去提供最好的服务。
+
+比如，zookeeper是哪种呢？网上大部分会说，zk是CP的， 但笔者看来却并不是。
+之所以说zk是cp，是因为zk的writer是全部转发到leader来处理，并在大多数follower认可之后写入成功。因此只要写入了数据就一定是有效且不会丢失的。 但当leader服务宕机之后，需要重新选举leader，才可以继续提供服务，因此zk并不是高可用的。
+
+但在read时，zk为了提高吞吐率，client只要读取follower的数据就ok，那么zk就并非一个强一致的应用。虽然可以通过follower的sync（实时获取leader的最新数据）来处理成**读强一致性**，但可用性就牺牲太大了。 
+
+同时，zk还提供了一种readonly状态机制，即使在zk 进行leader选举时，也可以提供只读服务。那么在一个read远远多于write的场景，zk甚至可以说是满足AP的，read弱一致性，但高可用。
+
+这个世界上没有银弹，对于分布式尤其如此。 固然可能随着技术的更新换代，有些协议或者技术不符合当前场景，但大部分其实是没有优劣之分，只是各有取舍，根据业务的实际场景选择合适的技术方式方案，才是我们开发者所真正需要掌握的技能。
+
+## Paxos
+
+paxos是1990年由莱斯利·兰伯特（英语：Leslie Lamport，LaTeX中的「La」）于1990年提出的一种基于消息传递且具有高度容错特性的一致性算法。
+
+### Basic Paxos
+basic paxos是paxos的最初版本，也是最基础的分布式协议。 
+在协议中，会有几个角色：
+* proposer 提案者。
+* acceptor 提案处理者，针对提案进行判断，通过则提案成为决议。
+* learner 获取所有被批准的提案（决议），用于返回给请求方。
+
+paxos决议的过程如下（摘自[维基百科](https://zh.wikipedia.org/wiki/Paxos%E7%AE%97%E6%B3%95)）：
+1. 准备（prepare）阶段：
+	1. proposer选择一个提案编号n并将prepare请求发送给acceptors中的一个多数派；
+	1. acceptor收到prepare消息后，如果提案的编号大于它已经回复的所有prepare消息(回复消息表示接受accept)，则acceptor将自己上次接受的提案回复给proposer，并承诺不再回复小于n的提案；
+2. 批准（accept）阶段：
+	1. 当一个proposer收到了多数acceptors对prepare的回复后，就进入批准阶段。它要向回复prepare请求的acceptors发送accept请求，包括编号n和根据P2c决定的value（如果根据P2c没有已经接受的value，那么它可以自由决定value）。
+	1. 在不违背自己向其他proposer的承诺的前提下，acceptor收到accept请求后即批准这个请求。
+
+流程图如下：
+```
+假设之前的最新提案号是N-1
+Client   Proposer      Acceptor     Learner
+   |         |          |  |  |       |  | 
+   X-------->|          |  |  |       |  |  Request 提交数据变更V
+   |         X--------->|->|->|       |  |  Prepare(N) prepare1.1 proposer进行提案。新的提案号为N
+   |         |<---------X--X--X       |  |  Promise(N,{Va,Vb,Vc}) prepare1.2 三台Acceptor发现都是最新的版本，因此做出承诺（不再											   回复小于N的提案）
+   |         X--------->|->|->|       |  |  Accept!(N,V) accept1.1 proposer发现多数acceptors回复通过，则提交批准请求
+   |         |<---------X--X--X------>|->|  Accepted(N,V) acceptor批准请求，并同步到learners
+   |<---------------------------------X--X  Response learners处理准备的决议（V），并返回给客户端。
+   |         |          |  |  |       |  |
+```
+
+流程通过时比较顺利，但在并发环境下，可能会出现资源浪费和活锁：
+```
+假设当前最新提案号都是N-1
+Client   Proposer      Acceptor     Learner
+ | |       | |          |  |  |       |  | 
+ X ------->| |          |  |  |       |  |  Request(V) Client1 提交数据变更V
+ | X-------->|          |  |  |       |  |  Request(W) Client2 提交数据变更W
+ | |	   X----------->|->|->|       |  |  Prepare(N,V) proposer1进行提案，新的提案号是N 
+ | |       |<-----------X--X--X       |  |  Promise(N,V) prepare1.2 三台Acceptor发现都是最新的版本，因此做出承诺（不再回复小于N的提案）
+ | |       | X--------->|->|->|       |  |  Prepare(N,W) proposer2进行提案，此时并不知道p1的提案，因此提案号也是N。
+ | |       | |<---------X--X--X       |  |  Reject(N,W) 根据prepare1.2的协议，acceptors已经回复了proposer1编号为N的提案，针对proposer2,直接否决，并返回最新的提案号为N。
+ | |       | X--------->|->|->|       |  |  Prepare(N+1,W) proposer2发现最新的提案号是N，自己保留的已经失效，因此更新提案号(N+1)重新提案。
+ | |       | |<---------X--X--X       |  |  Promise(N+1,W) prepare1.2 三台Acceptor发现新的提案编号较新，因此做出承诺（不再回复小于N+1的提案）
+ | |       X----------->|->|->|       |  |  Accept!(N,V) accept1.1 此时proposer1对于proposer2的提交号全局编号的变化并不知情，只知道自身之前提交的prepare已经被acceptors promise了，因此发起批准请求。
+ | |       |<-----------|<-|<-|       |  |  Reject(N,V) accept1.2 根据协议，由于acceptors批准p1的请求会违背对于proposer2的承诺，因此拒绝，并返回最能的编号N+1
+ | |       X----------->|->|->|       |  |  Prepare(N+2,V) proposer1发现最新的提案号时N+1，自己的已经实效，因此更新提案号(N+2)重新提案。
+ .......................
+```
+以此类推，proposer1和proposer2的循环由于prepare阶段和accept阶段的交替进行可能无限下去。之所以是活锁是因为如果某个proposer在prepare之后马上accept，则可以解开这个循环。 不过随着节点和并发请求的增多，即使不会出现活锁，也会有大量的资源消耗。
+
+### Multi-Paxos
+
+
+
+
+
+
+
+
